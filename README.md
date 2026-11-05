@@ -95,6 +95,27 @@ delegated work to whichever account has quota to spare.
 - The prompt cache is per account and per model, so forking a long session
   onto the second account bills every token uncached on its first turn.
 
+## Make it the default for a while
+
+`shell/claude-default.zsh` (opt-in; source it from `~/.zshrc`) sends new
+interactive `claude` sessions to the second account **with ultracode on**, so
+standing multi-agent workflows spend its quota instead of yours:
+
+```bash
+ultra-default on                      # until the second account's weekly reset
+ultra-default on "2026-11-09 15:00"   # or until a date
+ultra-default status | off
+claude-me                             # your own account, whatever the default
+cu                                    # second account + ultracode, always
+```
+
+It stands down by itself when the date passes or the second account's week
+passes `CLAUDE_ULTRA_MAX_PCT` (default 80%, from quotamax's last reading). Only
+interactive starts are redirected: `claude -p`, subcommands and
+`claude "a prompt"` run as usual, and scripts never see the function. Sessions
+on the second account have no claude.ai connectors (Gmail, Calendar, Drive...)
+and no Claude in Chrome; use `claude-me` for those.
+
 ## Commands
 
 | Command | Does |
@@ -108,6 +129,7 @@ delegated work to whichever account has quota to spare.
 
 ```bash
 bash test/test.sh
+zsh test/test-default.zsh
 ```
 
 No network and no real token. The Keychain round-trip uses a throwaway item.
