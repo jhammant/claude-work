@@ -1,0 +1,12 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install shellcheck
+      - run: shellcheck -S warning bin/claude-work test/test.sh
+      - run: bash test/test.sh
+        env:
+          CLAUDE_WORK_SKIP_KEYCHAIN: "1"
