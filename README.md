@@ -116,6 +116,40 @@ interactive starts are redirected: `claude -p`, subcommands and
 on the second account have no claude.ai connectors (Gmail, Calendar, Drive...)
 and no Claude in Chrome; use `claude-me` for those.
 
+## A swarm of accounts: claude-swarm
+
+`bin/claude-swarm` sends headless tasks to one or more extra accounts, picks the
+one with the most room, and keeps the output, so a coding agent can delegate
+work and check it afterwards. Each account is a Keychain item written by
+`claude-work login`; the first one is the `claude-work` login itself.
+
+```bash
+claude-swarm accounts [--probe]                 # weekly %, cap, agents running/allowed, models
+claude-swarm run --dir REPO --slug fix-parser --prompt brief.md --worktree --model fable --effort high
+claude-swarm fan --dir REPO --worktree --agents 4 briefs/*.md   # one task per file, in parallel
+claude-swarm resume fix-parser --prompt fix.md  # a follow-up in the same session and account
+claude-swarm status                             # running and recent tasks
+claude-swarm add client-x --max-agents 2        # then: CLAUDE_WORK_KEYCHAIN=claude-swarm-client-x claude-work login
+claude-swarm model fable claude-fable-5-3       # repoint an alias when a new model ships
+```
+
+- **Accounts and limits** live in `~/.config/claude-swarm/accounts.json`: per account
+  `keychain`, `max_agents` (default 3), `max_pct` (stop at this weekly %, default 85) and
+  `models`; at the top, the model aliases, `default_model` and `fallback_model`.
+- **Picking:** the least loaded account first, then the one with most weekly headroom.
+  Accounts at their cap, rate-limited or without a token are skipped, with the reason.
+  Quota comes from each task's own `rate_limit_event`, a `--probe`, or quotamax's
+  reading of the `claude-work` account.
+- **Limits mid-task:** if the default model's own cap is reached, the same session
+  continues on `fallback_model`; if the whole account is limited, it continues on
+  another account (transcripts are shared, so `--resume` works across accounts).
+- **Safety:** `--worktree` gives each task its own checkout and branch `cs/<slug>`.
+  Workers start with no MCP servers. A task that never starts a turn is stopped after
+  5 minutes, and one whose output stalls for 30 minutes is stopped too, with its whole
+  process group. Output: `~/.local/state/claude-swarm/runs/<slug>.{txt,jsonl,meta.json}`.
+- **Agent skill:** `skill/claudeswarm` (with the alias `skill/cs`) tells a Claude Code
+  session how to brief, dispatch, verify and fix. Link it into `~/.claude/skills/`.
+
 ## Commands
 
 | Command | Does |
@@ -130,6 +164,7 @@ and no Claude in Chrome; use `claude-me` for those.
 ```bash
 bash test/test.sh
 zsh test/test-default.zsh
+python3 -m unittest discover -s test -p 'test_*.py'
 ```
 
 No network and no real token. The Keychain round-trip uses a throwaway item.

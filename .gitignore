@@ -2,3 +2,4 @@
 *.log
 STATE.md
 .sessions/
+__pycache__/

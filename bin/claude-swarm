@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""claude-swarm: run Claude Code tasks on your other Claude accounts.
+
+Each account is a `claude setup-token` token in the macOS Keychain (the same
+item `claude-work login` writes). A task runs as one headless `claude --print`
+process with that token in its environment only, so your own login and every
+open session stay on your account. Accounts and models live in one JSON file;
+adding an account is `claude-swarm add NAME` plus a sign-in.
+
+  claude-swarm accounts [--probe]          accounts, quota, running agents, models
+  claude-swarm add NAME [--keychain ITEM] [--max-agents N] [--max-pct P] [--models a,b]
+  claude-swarm remove NAME
+  claude-swarm model ALIAS MODEL_ID        point an alias (fable, opus, sonnet) at a new model
+  claude-swarm pick [--model M]            which account the next task would go to
+  claude-swarm run --dir D --slug S --prompt FILE [--model M] [--account A] [--effort E] [--worktree]
+  claude-swarm fan --dir D [--agents N] [--model M] [--effort E] [--worktree] PROMPT_FILE...
+  claude-swarm resume SLUG --prompt FILE [--model M] [--effort E]
+  claude-swarm status                      running and recent tasks
+
+Exit codes: 0 done; 1 the agent finished with an error; 2 bad input or no
+token; 3 no turn started; 4 the log stopped growing; 5 no final message;
+6 no account has room for this model.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("CLAUDE_SWARM_CONFIG", HOME / ".config" / "claude-swarm" / "accounts.json"))
+STATE = Path(os.environ.get("CLAUDE_SWARM_STATE", HOME / ".local" / "state" / "claude-swarm"))
+# quotamax already probes the claude-work account in the background; reuse its reading.
+QUOTAMAX_CACHE = HOME / ".local" / "state" / "quotamax" / "claude-work-ratelimit.json"
+CLAUDE_WORK_ITEM = "claude-work-oauth"
+
+SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+LIMIT_RE = re.compile(r"usage limit|rate limit|limit reached|out of (extra )?usage|weekly limit", re.I)
+STARTED_RE = re.compile(r'"type"\s*:\s*"(assistant|user|result)"')
+EMPTY_MCP = '{"mcpServers":{}}'
+
+DEFAULTS = {
+    # Aliases keep briefs stable when a new model ships: change the id here only.
+    "models": {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5"},
+    "default_model": "fable",
+    # When the default model's own cap is reached, the task continues on this one.
+    "fallback_model": "opus",
+    "max_agents": 3,
+    "max_pct": 85,
+    "effort": None,
+    "permission_mode": "auto",
+    "mcp_config": EMPTY_MCP,
+    "accounts": [{"name": "work", "keychain": CLAUDE_WORK_ITEM}],
+}
+
+PROBE_ARGS = ["-p", "ok", "--model", "claude-haiku-4-5", "--system-prompt", "Reply ok.", "--tools", "",
+              "--setting-sources", "", "--strict-mcp-config", "--mcp-config", EMPTY_MCP,
+              "--no-session-persistence", "--output-format", "stream-json", "--verbose"]
+
+print_lock = threading.Lock()
+state_lock = threading.Lock()
+
+
+class SwarmError(Exception):
+    def __init__(self, message: str, code: int = 2):
+        super().__init__(message)
+        self.code = code
+
+
+def say(*parts: str) -> None:
+    with print_lock:
+        print(*parts, flush=True)
+
+
+# -- config --------------------------------------------------------------------
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if CONFIG.exists():
+        try:
+            data = json.loads(CONFIG.read_text())
+        except ValueError as exc:
+            raise SwarmError(f"{CONFIG} is not valid JSON: {exc}")
+        models = dict(cfg["models"])
+        models.update(data.get("models") or {})
+        cfg.update(data)
+        cfg["models"] = models
+    names = set()
+    for acct in cfg["accounts"]:
+        name = acct.get("name", "")
+        if not SLUG_RE.match(name) or name in names:
+            raise SwarmError(f"account names must be unique letters, digits, dots, dashes: {name!r}")
+        if not acct.get("keychain"):
+            raise SwarmError(f"account {name} has no keychain item")
+        names.add(name)
+        acct.setdefault("max_agents", cfg["max_agents"])
+        acct.setdefault("max_pct", cfg["max_pct"])
+        acct.setdefault("models", list(cfg["models"]))
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    keep = {k: v for k, v in cfg.items() if k != "accounts"}
+    keep["accounts"] = [{k: v for k, v in a.items()} for a in cfg["accounts"]]
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keep, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG)
+
+
+def resolve_model(cfg: dict, spec: str | None) -> tuple[str, str]:
+    """An alias (fable) or a full id (claude-...) to (alias, model id)."""
+    spec = spec or cfg["default_model"]
+    if spec in cfg["models"]:
+        return spec, cfg["models"][spec]
+    if spec.startswith("claude-"):
+        for alias, model_id in cfg["models"].items():
+            if model_id == spec:
+                return alias, spec
+        return spec, spec
+    raise SwarmError(f"unknown model {spec!r}; aliases: {', '.join(cfg['models'])}, or a full claude-... id")
+
+
+def account(cfg: dict, name: str) -> dict:
+    for acct in cfg["accounts"]:
+        if acct["name"] == name:
+            return acct
+    raise SwarmError(f"no account named {name!r}; see: claude-swarm accounts")
+
+
+# -- tokens and quota ----------------------------------------------------------
+
+def has_token(item: str) -> bool:
+    return subprocess.run(["security", "find-generic-password", "-s", item],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def read_token(item: str) -> str | None:
+    out = subprocess.run(["security", "find-generic-password", "-s", item, "-w"],
+                         capture_output=True, text=True)
+    token = out.stdout.strip()
+    return token if out.returncode == 0 and token else None
+
+
+def claude_bin() -> str:
+    return os.environ.get("CLAUDE_BIN", "claude")
+
+
+def child_env(token: str, name: str) -> dict:
+    env = dict(os.environ)
+    # Credentials that outrank an OAuth token would silently pick another account.
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_SESSION_ID"):
+        env.pop(key, None)
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    env["CLAUDE_WORK_ACCOUNT"] = "1"
+    env["CLAUDE_SWARM_ACCOUNT"] = name
+    return env
+
+
+def quota_path(name: str) -> Path:
+    return STATE / "quota" / f"{name}.json"
+
+
+def save_quota(name: str, info: dict) -> None:
+    path = quota_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"at": int(time.time() * 1000), "info": info}))
+
+
+def read_quota(acct: dict) -> dict | None:
+    """The newest reading for an account: {week, five_hour, status, resets_at, age_s}."""
+    readings = []
+    sources = [quota_path(acct["name"])]
+    if acct["keychain"] == CLAUDE_WORK_ITEM:
+        sources.append(QUOTAMAX_CACHE)
+    for path in sources:
+        try:
+            data = json.loads(path.read_text())
+            readings.append((int(data["at"]), data["info"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    if not readings:
+        return None
+    at, info = max(readings, key=lambda r: r[0])
+    windows = info.get("unifiedWindows") or {}
+    week = windows.get("seven_day") or {}
+    five = windows.get("five_hour") or {}
+    return {
+        "week": round(float(week.get("utilization", 0)) * 100),
+        "five_hour": round(float(five.get("utilization", 0)) * 100) if five else None,
+        "status": info.get("status", "?"),
+        "resets_at": week.get("resetsAt") or info.get("resetsAt"),
+        "age_s": max(0, int(time.time() - at / 1000)),
+    }
+
+
+def rate_limit_info(log_text: str) -> dict | None:
+    info = None
+    for line in log_text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "rate_limit_event":
+            info = event.get("rate_limit_info") or info
+    return info
+
+
+def probe(acct: dict) -> dict | None:
+    token = read_token(acct["keychain"])
+    if not token:
+        return None
+    try:
+        out = subprocess.run([claude_bin()] + PROBE_ARGS, env=child_env(token, acct["name"]),
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
+                             cwd=os.environ.get("TMPDIR", "/tmp"))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    info = rate_limit_info(out.stdout)
+    if info:
+        save_quota(acct["name"], info)
+    return info
+
+
+def cool_path(name: str) -> Path:
+    return STATE / "quota" / f"{name}.cool.json"
+
+
+def cooling(name: str) -> dict:
+    """{model alias or '*': until} for limits a task has hit, dropping expired ones."""
+    try:
+        data = json.loads(cool_path(name).read_text())
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > now}
+
+
+def set_cooling(name: str, key: str, until: float) -> None:
+    data = cooling(name)
+    data[key] = until
+    path = cool_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+# -- jobs ------------------------------------------------------------------------
+
+def jobs_dir() -> Path:
+    return STATE / "jobs"
+
+
+def runs_dir() -> Path:
+    return STATE / "runs"
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def live_jobs() -> list[dict]:
+    jobs = []
+    for path in sorted(jobs_dir().glob("*.json")):
+        try:
+            job = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if alive(int(job.get("pid", 0))):
+            jobs.append(job)
+        else:
+            path.unlink(missing_ok=True)
+    return jobs
+
+
+class StateLock:
+    """One lock across processes (flock) and threads (fan), held while picking and registering."""
+
+    def __enter__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        state_lock.acquire()
+        self.handle = open(STATE / "lock", "w")
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.handle, fcntl.LOCK_UN)
+        self.handle.close()
+        state_lock.release()
+
+
+def candidates(cfg: dict, alias: str, only: str | None = None) -> tuple[list[dict], list[str], bool]:
+    """Accounts that can take a task now, best first; plus why the others can't, and
+    whether the only obstacle is that every account is busy (worth waiting for)."""
+    running = {}
+    for job in live_jobs():
+        running[job["account"]] = running.get(job["account"], 0) + 1
+    ready, reasons, busy_only = [], [], True
+    for index, acct in enumerate(cfg["accounts"]):
+        name = acct["name"]
+        if only and name != only:
+            continue
+        used = running.get(name, 0)
+        quota = read_quota(acct)
+        cool = cooling(name)
+        why = None
+        if alias in cfg["models"] and alias not in acct["models"]:
+            why = f"{name}: not set up for {alias}"
+        elif not has_token(acct["keychain"]):
+            why = f"{name}: no token (sign in: CLAUDE_WORK_KEYCHAIN={acct['keychain']} claude-work login)"
+        elif "*" in cool or alias in cool:
+            until = cool.get(alias) or cool.get("*")
+            why = f"{name}: limit reached{'' if '*' in cool else ' for ' + alias}, until {time.strftime('%a %H:%M', time.localtime(until))}"
+        elif quota and quota["status"] == "rejected":
+            why = f"{name}: account is rate-limited"
+        elif quota and quota["week"] >= acct["max_pct"]:
+            why = f"{name}: weekly {quota['week']}% is at its {acct['max_pct']}% cap"
+        elif quota and quota["five_hour"] is not None and quota["five_hour"] >= 95:
+            why = f"{name}: 5h window {quota['five_hour']}% used"
+        elif used >= int(acct["max_agents"]):
+            reasons.append(f"{name}: all {acct['max_agents']} agents busy")
+            continue
+        if why:
+            reasons.append(why)
+            busy_only = False
+            continue
+        load = used / max(1, int(acct["max_agents"]))
+        ready.append((load, quota["week"] if quota else 0, index, acct))
+    ready.sort(key=lambda r: r[:3])
+    if only and not any(a["name"] == only for a in cfg["accounts"]):
+        raise SwarmError(f"no account named {only!r}")
+    return [r[3] for r in ready], reasons, busy_only and bool(reasons)
+
+
+def register(slug: str, acct: dict, alias: str, run_dir: str) -> Path:
+    path = jobs_dir() / f"{slug}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"slug": slug, "account": acct["name"], "model": alias,
+                                "pid": os.getpid(), "dir": run_dir, "started": int(time.time())}))
+    return path
+
+
+def make_worktree(directory: Path, slug: str) -> Path:
+    top = subprocess.run(["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    if top.returncode != 0:
+        raise SwarmError(f"--worktree needs a git work tree: {directory}")
+    root = Path(top.stdout.strip())
+    target = root.parent / f"{root.name}--cs-{slug}"
+    made = subprocess.run(["git", "-C", str(root), "worktree", "add", "-b", f"cs/{slug}", str(target), "HEAD"],
+                          capture_output=True, text=True)
+    if made.returncode != 0:
+        raise SwarmError(f"git worktree add failed: {made.stderr.strip()}")
+    return target
+
+
+# -- running a task ----------------------------------------------------------------
+
+def parse_log(text: str) -> dict:
+    result, session = None, None
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        session = event.get("session_id") or session
+        if event.get("type") == "result":
+            result = event
+    return {"result": result, "session": session}
+
+
+def watch(cmd: list[str], env: dict, cwd: str, prompt_file: Path, log: Path) -> int:
+    """Run cmd with the prompt on stdin; 3 if no turn starts, 4 if the log stalls."""
+    start_timeout = int(os.environ.get("START_TIMEOUT", "300"))
+    stall_timeout = int(os.environ.get("STALL_TIMEOUT", "1800"))
+    interval = float(os.environ.get("WATCH_INTERVAL", "3"))
+    with open(prompt_file, "rb") as stdin, open(log, "wb") as out:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=stdin, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        began = last_change = time.time()
+        last_size, started = 0, False
+        while proc.poll() is None:
+            time.sleep(interval)
+            now = time.time()
+            size = log.stat().st_size
+            if size > last_size:
+                last_change, last_size = now, size
+                if not started and STARTED_RE.search(log.read_text(errors="replace")):
+                    started = True
+            if proc.poll() is not None:
+                break
+            if not started and now - began >= start_timeout:
+                stop(proc)
+                return 3
+            if started and now - last_change >= stall_timeout:
+                stop(proc)
+                return 4
+        return proc.returncode
+
+
+def stop(proc: subprocess.Popen) -> None:
+    """TERM then KILL the task's whole process group, so tool children can't outlive it."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # macOS answers EPERM for a group that holds only exited processes.
+            break
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            continue
+    proc.wait()
+
+
+def next_stem(slug: str, fix: bool) -> Path:
+    runs_dir().mkdir(parents=True, exist_ok=True)
+    if not fix:
+        return runs_dir() / slug
+    n = 1
+    while (runs_dir() / f"{slug}.fix{n}.meta.json").exists():
+        n += 1
+    return runs_dir() / f"{slug}.fix{n}"
+
+
+def run_task(cfg: dict, *, slug: str, directory: str, prompt: Path, model: str | None = None,
+             only: str | None = None, effort: str | None = None, worktree: bool = False,
+             resume: dict | None = None, wait: bool = False, retried: bool = False) -> int:
+    if not SLUG_RE.match(slug):
+        raise SwarmError("slug must contain only letters, digits, dots, underscores or hyphens")
+    if not prompt.is_file() or prompt.stat().st_size == 0:
+        raise SwarmError(f"prompt file missing or empty: {prompt}")
+    alias, model_id = resolve_model(cfg, model)
+    run_dir = Path(directory).expanduser().resolve()
+    if not run_dir.is_dir():
+        raise SwarmError(f"no such directory: {run_dir}")
+    if worktree and not resume:
+        run_dir = make_worktree(run_dir, slug)
+
+    while True:
+        with StateLock():
+            if not resume and any(j["slug"] == slug for j in live_jobs()):
+                raise SwarmError(f"a task named {slug} is already running")
+            ready, reasons, busy_only = candidates(cfg, alias, only)
+            if ready:
+                acct = ready[0]
+                job_file = register(slug if not resume else f"{slug}.resume", acct, alias, str(run_dir))
+                break
+        if not (wait and busy_only):
+            raise SwarmError("no account has room for " + alias + ": " + "; ".join(reasons), 6)
+        time.sleep(float(os.environ.get("CLAUDE_SWARM_WAIT_INTERVAL", "5")))
+
+    stem = next_stem(slug, fix=bool(resume) or retried)
+    log, txt, meta_path = Path(f"{stem}.jsonl"), Path(f"{stem}.txt"), Path(f"{stem}.meta.json")
+    try:
+        token = read_token(acct["keychain"])
+        if not token:
+            raise SwarmError(f"no token for {acct['name']}: CLAUDE_WORK_KEYCHAIN={acct['keychain']} claude-work login")
+        cmd = [claude_bin(), "--print", "--output-format", "stream-json", "--verbose",
+               "--permission-mode", cfg.get("permission_mode") or "auto",
+               "--strict-mcp-config", "--mcp-config", cfg.get("mcp_config") or EMPTY_MCP,
+               "--model", model_id]
+        effort = effort or cfg.get("effort")
+        if effort:
+            cmd += ["--effort", effort]
+        if resume and resume.get("session"):
+            cmd += ["--resume", resume["session"]]
+        began = time.time()
+        say(f"run: {stem.name} on {acct['name']} ({alias} = {model_id}) in {run_dir}")
+        code = watch(cmd, child_env(token, acct["name"]), str(run_dir), prompt, log)
+        token = None
+        text = log.read_text(errors="replace")
+        info = rate_limit_info(text)
+        if info:
+            save_quota(acct["name"], info)
+        parsed = parse_log(text)
+        result = parsed["result"]
+        if code in (3, 4):
+            say(f"watch: {'no turn started' if code == 3 else 'log stopped growing'}; log: {log}")
+        elif result is None:
+            code = 5
+        else:
+            txt.write_text(str(result.get("result") or ""))
+            code = 1 if result.get("is_error") else 0
+        meta = {"slug": slug, "account": acct["name"], "model": alias, "model_id": model_id,
+                "dir": str(run_dir), "session": parsed["session"], "code": code,
+                "started": int(began), "seconds": int(time.time() - began),
+                "cost_usd": (result or {}).get("total_cost_usd"), "turns": (result or {}).get("num_turns"),
+                "fix_of": resume.get("stem") if resume else None, "worktree": worktree}
+        meta_path.write_text(json.dumps(meta, indent=2))
+    finally:
+        job_file.unlink(missing_ok=True)
+
+    final = (result or {}).get("result") or ""
+    if code == 1 and LIMIT_RE.search(str(final)) and not retried:
+        whole = bool(info and info.get("status") == "rejected")
+        until = float((info or {}).get("resetsAt") or time.time() + 3600)
+        set_cooling(acct["name"], "*" if whole else alias, until)
+        fallback = alias if whole else cfg.get("fallback_model")
+        if fallback:
+            say(f"run: {acct['name']} hit a {'usage' if whole else alias} limit; continuing on {fallback}")
+            note = runs_dir() / f"{slug}.continue.md"
+            if parsed["session"]:
+                note.write_text("You stopped because of a usage limit. Continue the task from where you left off.\n")
+                again = {"session": parsed["session"], "stem": stem.name}
+            else:
+                note.write_text(prompt.read_text())
+                again = None
+            return run_task(cfg, slug=slug, directory=str(run_dir), prompt=note, model=fallback,
+                            only=None if whole else acct["name"], effort=effort, resume=again,
+                            wait=wait, retried=True)
+    say(f"run: {stem.name} exited {code} after {meta['seconds']}s on {acct['name']} ({alias}). "
+        f"Final message: {txt}; session: {parsed['session'] or 'unavailable'}")
+    return code
+
+
+# -- commands ----------------------------------------------------------------------
+
+def fmt_reset(ts) -> str:
+    return time.strftime("%a %d %b %H:%M", time.localtime(ts)) if ts else "?"
+
+
+def fmt_age(seconds: int) -> str:
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def cmd_accounts(cfg: dict, args) -> int:
+    running = {}
+    for job in live_jobs():
+        running[job["account"]] = running.get(job["account"], 0) + 1
+    print(f"claude-swarm accounts ({CONFIG}{'' if CONFIG.exists() else ', defaults'})")
+    print("  models: " + ", ".join(f"{a} = {m}" for a, m in cfg["models"].items())
+          + f"; default {cfg['default_model']}, fallback {cfg.get('fallback_model') or 'none'}")
+    for acct in cfg["accounts"]:
+        token = has_token(acct["keychain"])
+        if args.probe and token:
+            probe(acct)
+        quota = read_quota(acct)
+        if quota:
+            five = f", 5h {quota['five_hour']}%" if quota["five_hour"] is not None else ""
+            q = f"weekly {quota['week']}%{five} (cap {acct['max_pct']}%, resets {fmt_reset(quota['resets_at'])}, read {fmt_age(quota['age_s'])} ago)"
+        else:
+            q = "no quota reading yet (claude-swarm accounts --probe)"
+        cool = cooling(acct["name"])
+        print(f"  {acct['name']}: {q}")
+        print(f"    agents {running.get(acct['name'], 0)}/{acct['max_agents']} · models {', '.join(acct['models'])}"
+              f" · token {'ok' if token else 'missing'} · keychain {acct['keychain']}"
+              + (f" · limit hit: {', '.join(cool)}" if cool else ""))
+    return 0
+
+
+def cmd_add(cfg: dict, args) -> int:
+    if not SLUG_RE.match(args.name):
+        raise SwarmError("account names are letters, digits, dots, underscores or hyphens")
+    if any(a["name"] == args.name for a in cfg["accounts"]):
+        raise SwarmError(f"account {args.name} already exists")
+    acct = {"name": args.name, "keychain": args.keychain or f"claude-swarm-{args.name}"}
+    if args.max_agents is not None:
+        acct["max_agents"] = args.max_agents
+    if args.max_pct is not None:
+        acct["max_pct"] = args.max_pct
+    if args.models:
+        acct["models"] = [m.strip() for m in args.models.split(",") if m.strip()]
+        for alias in acct["models"]:
+            resolve_model(cfg, alias)
+    cfg["accounts"].append(acct)
+    save_config(cfg)
+    print(f"Added {args.name}. Sign it in from a normal terminal (it opens a sign-in URL):")
+    print(f"  CLAUDE_WORK_KEYCHAIN={acct['keychain']} claude-work login")
+    return 0
+
+
+def cmd_remove(cfg: dict, args) -> int:
+    account(cfg, args.name)
+    cfg["accounts"] = [a for a in cfg["accounts"] if a["name"] != args.name]
+    save_config(cfg)
+    print(f"Removed {args.name} from the swarm (its Keychain token is left in place).")
+    return 0
+
+
+def cmd_model(cfg: dict, args) -> int:
+    if not args.model_id.startswith("claude-"):
+        raise SwarmError("model ids start with claude-, e.g. claude-fable-5-2")
+    cfg["models"][args.alias] = args.model_id
+    save_config(cfg)
+    print(f"{args.alias} = {args.model_id}")
+    return 0
+
+
+def cmd_pick(cfg: dict, args) -> int:
+    alias, model_id = resolve_model(cfg, args.model)
+    ready, reasons, _ = candidates(cfg, alias, args.account)
+    if ready:
+        print(f"{ready[0]['name']} ({alias} = {model_id})")
+    for reason in reasons:
+        print(f"  skipped {reason}")
+    return 0 if ready else 6
+
+
+def cmd_run(cfg: dict, args) -> int:
+    return run_task(cfg, slug=args.slug, directory=args.dir, prompt=Path(args.prompt), model=args.model,
+                    only=args.account, effort=args.effort, worktree=args.worktree, wait=args.wait)
+
+
+def cmd_fan(cfg: dict, args) -> int:
+    prompts = [Path(p) for p in args.prompts]
+    slugs = [args.prefix + p.stem for p in prompts]
+    if len(set(slugs)) != len(slugs):
+        raise SwarmError("prompt files need distinct names; each name becomes the task's slug")
+    alias, _ = resolve_model(cfg, args.model)
+    room = sum(int(a["max_agents"]) for a in cfg["accounts"]
+               if (not args.account or a["name"] == args.account)
+               and (alias not in cfg["models"] or alias in a["models"]))
+    agents = max(1, min(args.agents or room, len(prompts)))
+    say(f"fan: {len(prompts)} tasks, up to {agents} at once")
+    results = {}
+    queue = list(zip(slugs, prompts))
+
+    def worker() -> None:
+        while True:
+            with print_lock:
+                if not queue:
+                    return
+                slug, prompt = queue.pop(0)
+            try:
+                results[slug] = run_task(cfg, slug=slug, directory=args.dir, prompt=prompt, model=args.model,
+                                         only=args.account, effort=args.effort, worktree=args.worktree, wait=True)
+            except SwarmError as exc:
+                say(f"run: {slug}: {exc}")
+                results[slug] = exc.code
+
+    threads = [threading.Thread(target=worker) for _ in range(agents)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    failed = [s for s in slugs if results.get(s) != 0]
+    say(f"fan: {len(slugs) - len(failed)} of {len(slugs)} done" + (f"; not done: {', '.join(failed)}" if failed else ""))
+    return 0 if not failed else 1
+
+
+def cmd_resume(cfg: dict, args) -> int:
+    meta_path = runs_dir() / f"{args.slug}.meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        raise SwarmError(f"no run named {args.slug}: {meta_path}")
+    if not meta.get("session"):
+        raise SwarmError(f"{args.slug} has no session to resume")
+    return run_task(cfg, slug=args.slug, directory=meta["dir"], prompt=Path(args.prompt),
+                    model=args.model or meta["model"], only=meta["account"], effort=args.effort,
+                    resume={"session": meta["session"], "stem": args.slug}, wait=True)
+
+
+def cmd_status(cfg: dict, args) -> int:
+    jobs = live_jobs()
+    print(f"running: {len(jobs)}")
+    for job in jobs:
+        print(f"  {job['slug']} on {job['account']} ({job['model']}) for {fmt_age(int(time.time()) - job['started'])} in {job['dir']}")
+    metas = sorted(runs_dir().glob("*.meta.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+    if metas:
+        print("recent:")
+    for path in metas:
+        try:
+            m = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        print(f"  {path.name[:-10]}: exit {m['code']} · {m['account']} ({m['model']}) · {m['seconds']}s"
+              f" · {time.strftime('%d %b %H:%M', time.localtime(m['started']))}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="claude-swarm", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    a = sub.add_parser("accounts", help="accounts, quota, running agents, models")
+    a.add_argument("--probe", action="store_true", help="take a fresh quota reading (one tiny Haiku turn each)")
+    a = sub.add_parser("add", help="add an account to the swarm")
+    a.add_argument("name")
+    a.add_argument("--keychain", help="Keychain item for its token (default claude-swarm-NAME)")
+    a.add_argument("--max-agents", type=int)
+    a.add_argument("--max-pct", type=int, help="stop sending work at this weekly %%")
+    a.add_argument("--models", help="aliases this account may run, e.g. fable,opus")
+    a = sub.add_parser("remove", help="take an account out of the swarm")
+    a.add_argument("name")
+    a = sub.add_parser("model", help="point a model alias at a model id")
+    a.add_argument("alias")
+    a.add_argument("model_id")
+    a = sub.add_parser("pick", help="which account the next task would go to")
+    a.add_argument("--model")
+    a.add_argument("--account")
+    for name in ("run", "fan"):
+        a = sub.add_parser(name, help="run one task" if name == "run" else "run several tasks in parallel")
+        a.add_argument("--dir", required=True, help="the directory the agent works in")
+        a.add_argument("--model", help="alias (fable, opus, sonnet) or a full model id")
+        a.add_argument("--account", help="only this account")
+        a.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+        a.add_argument("--worktree", action="store_true", help="give each task its own git worktree and branch cs/<slug>")
+        if name == "run":
+            a.add_argument("--slug", required=True)
+            a.add_argument("--prompt", required=True, help="file holding the brief")
+            a.add_argument("--wait", action="store_true", help="wait for a free agent instead of failing")
+        else:
+            a.add_argument("--agents", type=int, help="most tasks at once (default: every free agent)")
+            a.add_argument("--prefix", default="", help="put before each slug")
+            a.add_argument("prompts", nargs="+", help="one brief per task; the file name is the slug")
+    a = sub.add_parser("resume", help="send a follow-up (fix pass) to a finished task's session")
+    a.add_argument("slug")
+    a.add_argument("--prompt", required=True)
+    a.add_argument("--model")
+    a.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    sub.add_parser("status", help="running and recent tasks")
+    return p
+
+
+COMMANDS = {"accounts": cmd_accounts, "add": cmd_add, "remove": cmd_remove, "model": cmd_model,
+            "pick": cmd_pick, "run": cmd_run, "fan": cmd_fan, "resume": cmd_resume, "status": cmd_status}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        return COMMANDS[args.command](load_config(), args)
+    except SwarmError as exc:
+        print(f"claude-swarm: {exc}", file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
