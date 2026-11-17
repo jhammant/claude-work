@@ -43,7 +43,7 @@ QUOTAMAX_CACHE = HOME / ".local" / "state" / "quotamax" / "claude-work-ratelimit
 CLAUDE_WORK_ITEM = "claude-work-oauth"
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-LIMIT_RE = re.compile(r"usage limit|rate limit|limit reached|out of (extra )?usage|weekly limit", re.I)
+LIMIT_RE = re.compile(r"usage limit|rate limit|limit reached|out of (extra )?usage|weekly limit|hit your [\w ]*limit", re.I)
 STARTED_RE = re.compile(r'"type"\s*:\s*"(assistant|user|result)"')
 EMPTY_MCP = '{"mcpServers":{}}'
 
@@ -458,6 +458,13 @@ def run_task(cfg: dict, *, slug: str, directory: str, prompt: Path, model: str |
             if not resume and any(j["slug"] == slug for j in live_jobs()):
                 raise SwarmError(f"a task named {slug} is already running")
             ready, reasons, busy_only = candidates(cfg, alias, only)
+            fallback = cfg.get("fallback_model")
+            if not ready and reasons and fallback and fallback != alias \
+                    and all(f"limit reached for {alias}" in r for r in reasons):
+                # Every account has used up this model's own cap: run on the fallback model instead.
+                say(f"run: every account has hit its {alias} limit; using {fallback}")
+                alias, model_id = resolve_model(cfg, fallback)
+                ready, reasons, busy_only = candidates(cfg, alias, only)
             if ready:
                 acct = ready[0]
                 job_file = register(slug if not resume else f"{slug}.resume", acct, alias, str(run_dir))

@@ -240,6 +240,20 @@ class SwarmTest(unittest.TestCase):
         # The cooled model is skipped until its reset.
         self.assertEqual(cs.candidates(cfg, "fable")[0], [])
 
+    def test_claude_codes_own_model_cap_message_counts_as_a_limit(self):
+        self.assertTrue(cs.LIMIT_RE.search("You've hit your Fable limit · resets Nov 23 at 3pm (Europe/London)."))
+
+    def test_a_cooled_default_model_runs_on_the_fallback(self):
+        # Arrange
+        cfg = cs.load_config()
+        cs.set_cooling("work", "fable", time.time() + 3600)
+        # Act
+        code, out = self.quiet(cs.run_task, cfg, slug="cooled", directory=str(self.work), prompt=self.prompt)
+        # Assert
+        self.assertEqual(code, 0)
+        self.assertEqual(self.records()[0]["model"], "claude-opus-5-5")
+        self.assertIn("using opus", out)
+
     def test_resume_goes_back_to_the_same_account_and_session(self):
         # Arrange
         cfg = self.two_accounts()
