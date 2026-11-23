@@ -385,8 +385,37 @@ def parse_log(text: str) -> dict:
     return {"result": result, "session": session}
 
 
+def _macslots():
+    """The Mac-wide limit on background Claude runs (~/dev/utilities/macslots; Jon, 23 Nov 2026), if installed."""
+    if os.environ.get("MACSLOTS_OFF"):
+        return None
+    try:
+        sys.path.insert(0, str(Path.home() / "dev/utilities/macslots"))
+        import macslots
+        return macslots
+    except Exception:
+        return None
+
+
 def watch(cmd: list[str], env: dict, cwd: str, prompt_file: Path, log: Path) -> int:
-    """Run cmd with the prompt on stdin; 3 if no turn starts, 4 if the log stalls."""
+    """Run cmd with the prompt on stdin; 3 if no turn starts, 4 if the log stalls. On the Mac it first takes a macslots
+    slot (waiting up to MACSLOTS_WAIT seconds, default an hour) so swarms queue instead of swamping it; 3 if none."""
+    ms = _macslots()
+    held = None
+    if ms is not None:
+        try:
+            held = ms.acquire(f"claude-swarm {prompt_file.stem}", wait=float(os.environ.get("MACSLOTS_WAIT", "3600")))
+        except ms.Busy as e:
+            say(f"not started: {e} (macslots)")
+            return 3
+    try:
+        return _watch(cmd, env, cwd, prompt_file, log)
+    finally:
+        if held is not None:
+            ms.release(held)
+
+
+def _watch(cmd: list[str], env: dict, cwd: str, prompt_file: Path, log: Path) -> int:
     start_timeout = int(os.environ.get("START_TIMEOUT", "300"))
     stall_timeout = int(os.environ.get("STALL_TIMEOUT", "1800"))
     interval = float(os.environ.get("WATCH_INTERVAL", "3"))
