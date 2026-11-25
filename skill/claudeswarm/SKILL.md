@@ -34,7 +34,7 @@ work here, or offer to wait.
 
 | What | Where it's set | Default |
 |---|---|---|
-| Model for one task | `--model fable\|opus\|sonnet` or a full id (`claude-...`) | `fable` (Fable 5.2) |
+| Model for one task | `--model fable\|opus\|sonnet` or a full id (`claude-...`) | `opus` (Opus 5.5) since 24 Nov 2026 |
 | What an alias means | `claude-swarm model fable claude-fable-5-3` | fable 5.2, opus 5.5, sonnet 5.5 |
 | If Fable's own cap is hit | `fallback_model` in the config | `opus`, same session continues |
 | Tasks at once in a fan-out | `--agents N` | every free agent |
@@ -44,12 +44,18 @@ work here, or offer to wait.
 | Thinking effort | `--effort low\|medium\|high\|xhigh\|max` | the CLI default |
 
 The config is `~/.config/claude-swarm/accounts.json`. Per-account values beat the top-level
-defaults. Pick by the task, not by habit:
+defaults. Pick by the task, not by habit.
 
-- **fable** for features, multi-file changes, debugging and anything hard. It costs about
-  2.5× Opus per token and has its own weekly cap, so the runner moves to Opus when that
-  cap is reached.
-- **opus** for contained modules and refactors, or when Fable is cooling.
+**Fable is not the default (Jon, 24 Nov 2026: "don't use fable for everything here").** In the
+first day of that week, 14 Fable runs used 49% of the work account's Fable allowance, several
+of them page tweaks and explainers. Pass `--model fable` only when the task is hard, and say
+in one line why.
+
+- **opus** (the default) for features, multi-file changes, contained modules, refactors and
+  ordinary debugging.
+- **fable** only for the hard ones: a design with real unknowns, a bug that has already beaten
+  Opus, a build where a wrong plan is expensive. It costs about 2.5× Opus per token and has
+  its own weekly cap; the runner moves to Opus when that cap is reached.
 - **sonnet** for mechanical work: tests for existing code, renames, summaries.
 - `--effort high` for real features; `xhigh` for hard debugging; leave it unset for small jobs.
 
