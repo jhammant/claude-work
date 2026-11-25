@@ -198,9 +198,33 @@ def read_quota(acct: dict) -> dict | None:
         "week": round(float(week.get("utilization", 0)) * 100),
         "five_hour": round(float(five.get("utilization", 0)) * 100) if five else None,
         "status": info.get("status", "?"),
+        "account_limited": account_limited(info),
         "resets_at": week.get("resetsAt") or info.get("resetsAt"),
         "age_s": max(0, int(time.time() - at / 1000)),
     }
+
+
+ACCOUNT_WINDOWS = ("five_hour", "seven_day")
+
+
+def account_limited(info: dict | None) -> bool:
+    """True only when a limit stops the whole account: its five-hour or seven-day window.
+
+    A model's own allowance (Fable's weekly cap arrives as rateLimitType
+    "seven_day_overage_included" while the seven-day window is still "allowed") is
+    rejected too, but only that model is stopped; the account's other models still run.
+    """
+    if not info or info.get("status") != "rejected":
+        return False
+    windows = info.get("unifiedWindows") or {}
+    if any((windows.get(name) or {}).get("status") == "rejected" for name in ACCOUNT_WINDOWS):
+        return True
+    kind = info.get("rateLimitType")
+    if kind in ACCOUNT_WINDOWS:
+        return True
+    # A named window that isn't the account's own is one model's allowance.
+    # With no detail at all, assume the whole account, as before.
+    return not (kind or windows)
 
 
 def rate_limit_info(log_text: str) -> dict | None:
@@ -325,7 +349,7 @@ def candidates(cfg: dict, alias: str, only: str | None = None) -> tuple[list[dic
         elif "*" in cool or alias in cool:
             until = cool.get(alias) or cool.get("*")
             why = f"{name}: limit reached{'' if '*' in cool else ' for ' + alias}, until {time.strftime('%a %H:%M', time.localtime(until))}"
-        elif quota and quota["status"] == "rejected":
+        elif quota and quota["account_limited"]:
             why = f"{name}: account is rate-limited"
         elif quota and quota["week"] >= acct["max_pct"]:
             why = f"{name}: weekly {quota['week']}% is at its {acct['max_pct']}% cap"
@@ -545,7 +569,7 @@ def run_task(cfg: dict, *, slug: str, directory: str, prompt: Path, model: str |
 
     final = (result or {}).get("result") or ""
     if code == 1 and LIMIT_RE.search(str(final)) and not retried:
-        whole = bool(info and info.get("status") == "rejected")
+        whole = account_limited(info)
         until = float((info or {}).get("resetsAt") or time.time() + 3600)
         set_cooling(acct["name"], "*" if whole else alias, until)
         fallback = alias if whole else cfg.get("fallback_model")

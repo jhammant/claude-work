@@ -52,6 +52,24 @@ FAKE_CLAUDE = textwrap.dedent("""\
         print(json.dumps({"type": "result", "is_error": True, "result": "Fable usage limit reached",
                           "session_id": "sess-1"}))
         sys.exit(1)
+    if mode == "fable-cap" and "fable" in model:
+        # What Claude Code really sends when Fable's own weekly allowance runs out (25 Nov 2026):
+        # the event is "rejected", but the account's seven-day window is still allowed.
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+              "status": "rejected", "resetsAt": 2000000000, "rateLimitType": "seven_day_overage_included",
+              "unifiedWindows": {"seven_day": {"utilization": 0.6, "resetsAt": 2000000000, "status": "allowed"},
+                                 "seven_day_overage_included": {"utilization": 1, "resetsAt": 2000000000,
+                                                                "status": "rejected"}}}}))
+        print(json.dumps({"type": "result", "is_error": True, "session_id": "sess-1",
+                          "result": "You've hit your Fable limit · resets Nov 30 at 3pm (Europe/London)."}))
+        sys.exit(1)
+    if mode == "account-limit" and os.environ.get("CLAUDE_SWARM_ACCOUNT") == "work":
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+              "status": "rejected", "resetsAt": 2000000000, "rateLimitType": "seven_day",
+              "unifiedWindows": {"seven_day": {"utilization": 1, "resetsAt": 2000000000, "status": "rejected"}}}}))
+        print(json.dumps({"type": "result", "is_error": True, "session_id": "sess-1",
+                          "result": "You've hit your usage limit · resets Nov 30 at 3pm (Europe/London)."}))
+        sys.exit(1)
     print(json.dumps({"type": "result", "is_error": False, "result": "done on " + model,
                       "session_id": "sess-1", "total_cost_usd": 0.01, "num_turns": 2}))
 """)
@@ -75,7 +93,9 @@ class SwarmTest(unittest.TestCase):
         fake.chmod(0o755)
         self.record = self.tmp / "record.jsonl"
         self.env = {"CLAUDE_BIN": str(fake), "FAKE_RECORD": str(self.record), "WATCH_INTERVAL": "0.1",
-                    "CLAUDE_SWARM_WAIT_INTERVAL": "0.1", "FAKE_MODE": "ok"}
+                    "CLAUDE_SWARM_WAIT_INTERVAL": "0.1", "FAKE_MODE": "ok",
+                    # The fake runs must not queue for (or take) the Mac's real macslots slots.
+                    "MACSLOTS_OFF": "1"}
         self.old_env = {k: os.environ.get(k) for k in list(self.env) + ["START_TIMEOUT"]}
         os.environ.update(self.env)
         self.addCleanup(self.restore_env)
@@ -239,6 +259,68 @@ class SwarmTest(unittest.TestCase):
         self.assertIn("continuing on opus", out)
         # The cooled model is skipped until its reset.
         self.assertEqual(cs.candidates(cfg, "fable")[0], [])
+
+    def test_fables_own_cap_falls_back_to_opus_on_the_same_account(self):
+        # Arrange
+        cfg = cs.load_config()
+        os.environ["FAKE_MODE"] = "fable-cap"
+        # Act
+        code, out = self.quiet(cs.run_task, cfg, slug="capped", directory=str(self.work),
+                               prompt=self.prompt, model="fable")
+        # Assert
+        self.assertEqual(code, 0)
+        first, second = self.records()
+        self.assertEqual(first["model"], "claude-fable-5-2")
+        self.assertEqual(second["model"], "claude-opus-5-5")
+        self.assertEqual(second["account"], "work")
+        self.assertEqual(list(cs.cooling("work")), ["fable"])
+        self.assertIn("continuing on opus", out)
+        self.assertNotEqual(cs.candidates(cfg, "opus")[0], [])
+
+    def test_a_model_cap_reading_does_not_block_the_accounts_other_models(self):
+        # Arrange
+        cfg = cs.load_config()
+        cs.save_quota("work", {"status": "rejected", "rateLimitType": "seven_day_overage_included",
+                               "unifiedWindows": {"seven_day": {"utilization": 0.6, "status": "allowed"},
+                                                  "seven_day_overage_included": {"utilization": 1,
+                                                                                 "status": "rejected"}}})
+        # Act
+        ready, reasons, _ = cs.candidates(cfg, "opus")
+        # Assert
+        self.assertEqual([a["name"] for a in ready], ["work"])
+        self.assertFalse(cs.read_quota(cfg["accounts"][0])["account_limited"])
+
+    def test_an_account_wide_limit_still_stops_every_model_on_that_account(self):
+        # Arrange
+        cfg = self.two_accounts()
+        self.quota("two", 10)
+        self.quota("work", 5)
+        os.environ["FAKE_MODE"] = "account-limit"
+        # Act
+        code, out = self.quiet(cs.run_task, cfg, slug="wall", directory=str(self.work),
+                               prompt=self.prompt, model="opus")
+        # Assert
+        self.assertEqual(code, 0)
+        first, second = self.records()
+        self.assertEqual((first["account"], second["account"]), ("work", "two"))
+        self.assertEqual(second["model"], "claude-opus-5-5")
+        self.assertIn("*", cs.cooling("work"))
+        self.assertIn("work: limit reached", " ".join(cs.candidates(cfg, "sonnet")[1]))
+
+    def test_account_limited_reads_each_shape_of_limit(self):
+        # Arrange
+        cases = [
+            (None, False),
+            ({"status": "allowed"}, False),
+            ({"status": "rejected"}, True),  # no detail: the whole account, as before
+            ({"status": "rejected", "rateLimitType": "five_hour"}, True),
+            ({"status": "rejected", "rateLimitType": "seven_day_opus"}, False),
+            ({"status": "rejected", "unifiedWindows": {"five_hour": {"status": "rejected"}}}, True),
+        ]
+        # Act
+        got = [cs.account_limited(info) for info, _ in cases]
+        # Assert
+        self.assertEqual(got, [want for _, want in cases])
 
     def test_claude_codes_own_model_cap_message_counts_as_a_limit(self):
         self.assertTrue(cs.LIMIT_RE.search("You've hit your Fable limit · resets Nov 23 at 3pm (Europe/London)."))

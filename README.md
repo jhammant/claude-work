@@ -140,9 +140,11 @@ claude-swarm model fable claude-fable-5-3       # repoint an alias when a new mo
   Accounts at their cap, rate-limited or without a token are skipped, with the reason.
   Quota comes from each task's own `rate_limit_event`, a `--probe`, or quotamax's
   reading of the `claude-work` account.
-- **Limits mid-task:** if the default model's own cap is reached, the same session
-  continues on `fallback_model`; if the whole account is limited, it continues on
-  another account (transcripts are shared, so `--resume` works across accounts).
+- **Limits mid-task:** if a model's own cap is reached (Fable's weekly allowance, for
+  example), only that model cools down and the same session continues on
+  `fallback_model` on the same account. Only a rejected five-hour or seven-day window
+  marks the whole account as limited; then the task continues on another account
+  (transcripts are shared, so `--resume` works across accounts).
 - **Safety:** `--worktree` gives each task its own checkout and branch `cs/<slug>`.
   Workers start with no MCP servers. A task that never starts a turn is stopped after
   5 minutes, and one whose output stalls for 30 minutes is stopped too, with its whole
